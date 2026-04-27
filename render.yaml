@@ -1,14 +1,12 @@
-# Crypto Radar — Render 部署配置
+# Crypto Radar — Render Blueprint 部署配置
 services:
-  - type: worker
+  - type: web
     name: crypto-radar
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python run.py
+    startCommand: python app.py
     envVars:
       - key: TG_BOT_TOKEN
         sync: false
       - key: TG_CHAT_ID
         sync: false
-      - key: SCAN_INTERVAL
-        value: 300
