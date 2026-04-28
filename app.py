@@ -152,15 +152,19 @@ def handle_command(chat_id, text):
     elif cmd == '/btc':
         tg_send(chat_id, "📈 正在获取 BTC 行情...")
         try:
-            ticker = requests.get(
+            resp = requests.get(
                 'https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=BTCUSDT',
                 timeout=10
-            ).json()
-            price = float(ticker['lastPrice'])
-            chg = float(ticker['priceChangePercent'])
-            high = float(ticker['highPrice'])
-            low = float(ticker['lowPrice'])
-            vol = float(ticker['quoteVolume'])
+            )
+            api_data = resp.json()
+            # Binance 可能返回 dict 或 list
+            if isinstance(api_data, list):
+                api_data = api_data[0] if api_data else {}
+            price = float(api_data.get('lastPrice', 0))
+            chg = float(api_data.get('priceChangePercent', 0))
+            high = float(api_data.get('highPrice', 0))
+            low = float(api_data.get('lowPrice', 0))
+            vol = float(api_data.get('quoteVolume', 0))
             emoji = "🟢" if chg >= 0 else "🔴"
             msg = (
                 f"📈 *BTC/USDT 永续合约*\n\n"
