@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Crypto Coke Bot — AI 对话 + 雷达信号 Bot
-- Telegram Webhook (python-telegram-bot)
+- Telegram Webhook (纯 requests, 不用 PTB)
 - AI 对话 (DeepSeek API)
 - 后台扫描线程 (币安合约 OI + 费率)
 """
@@ -11,9 +11,11 @@ import os
 import sys
 import time
 import threading
+import re
 from pathlib import Path
 from datetime import datetime
 
+import requests
 from flask import Flask, request, jsonify
 
 # ============ 导入扫描模块 ============
@@ -45,7 +47,138 @@ latest_data = {
     'last_scan': None,
 }
 
-# ============ DeepSeek AI 对话 ============
+# ============ Telegram API (纯 requests) ============
+TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+
+def tg_send(chat_id, text, parse_mode='Markdown'):
+    """发送消息到 Telegram"""
+    if not TG_BOT_TOKEN:
+        return
+    try:
+        # Markdown 太长或格式不对时回退到纯文本
+        resp = requests.post(
+            f"{TG_API}/sendMessage",
+            json={
+                'chat_id': chat_id,
+                'text': text,
+                'parse_mode': parse_mode
+            },
+            timeout=10
+        )
+        if resp.status_code != 200:
+            # 回退到纯文本
+            requests.post(
+                f"{TG_API}/sendMessage",
+                json={'chat_id': chat_id, 'text': text},
+                timeout=10
+            )
+    except Exception as e:
+        print(f"[TG] send error: {e}")
+
+def tg_send_action(chat_id, action='typing'):
+    """发送聊天动作"""
+    try:
+        requests.post(
+            f"{TG_API}/sendChatAction",
+            json={'chat_id': chat_id, 'action': action},
+            timeout=5
+        )
+    except:
+        pass
+
+
+# ============ 命令处理 ============
+def handle_command(chat_id, text):
+    """处理命令消息，返回 True 如果被处理"""
+    cmd = text.strip().lower().split()[0] if text else ''
+
+    if cmd == '/start':
+        welcome = (
+            "🚀 *Crypto Coke Bot 已上线！*\n\n"
+            "我是你的加密货币交易助手，支持：\n\n"
+            "🤖 *AI 对话* — 直接发消息跟我聊天\n"
+            "📡 */signals* — 查看最新费率转负信号\n"
+            "📊 */heat* — 查看热度做多雷达排行\n"
+            "📈 */btc* — BTC 实时行情\n"
+            "💡 */help* — 查看所有命令\n\n"
+            "随便问我什么，开始吧！"
+        )
+        tg_send(chat_id, welcome)
+        return True
+
+    elif cmd == '/help':
+        help_text = (
+            "📋 *可用命令：*\n\n"
+            "/start — 启动机器人\n"
+            "/signals — 查看最新费率转负信号\n"
+            "/heat — 查看热度做多雷达\n"
+            "/btc — BTC 实时行情\n"
+            "/help — 显示此帮助\n\n"
+            "或者直接跟我聊天，我会 AI 回复你！"
+        )
+        tg_send(chat_id, help_text)
+        return True
+
+    elif cmd == '/signals':
+        tg_send(chat_id, "📡 正在扫描费率转负信号，请稍候...")
+        try:
+            signals = scan_funding_reversal()
+            if signals:
+                strong = [s for s in signals if s['current_fr'] < 0 and s.get('oi_rising')]
+                if strong:
+                    msg = format_funding_alert(strong)
+                    if msg:
+                        tg_send(chat_id, msg)
+                        return True
+            tg_send(chat_id, "✅ 当前未发现新的费率转负信号")
+        except Exception as e:
+            tg_send(chat_id, f"❌ 扫描出错: {str(e)}")
+        return True
+
+    elif cmd == '/heat':
+        tg_send(chat_id, "📊 正在扫描热度雷达，请稍候...")
+        try:
+            hot_list = scan_heat_radar()
+            if hot_list:
+                msg = format_heat_alert(hot_list[:8])
+                if msg:
+                    tg_send(chat_id, msg)
+                    return True
+            tg_send(chat_id, "📊 暂无热度数据")
+        except Exception as e:
+            tg_send(chat_id, f"❌ 扫描出错: {str(e)}")
+        return True
+
+    elif cmd == '/btc':
+        tg_send(chat_id, "📈 正在获取 BTC 行情...")
+        try:
+            ticker = requests.get(
+                'https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=BTCUSDT',
+                timeout=10
+            ).json()
+            price = float(ticker['lastPrice'])
+            chg = float(ticker['priceChangePercent'])
+            high = float(ticker['highPrice'])
+            low = float(ticker['lowPrice'])
+            vol = float(ticker['quoteVolume'])
+            emoji = "🟢" if chg >= 0 else "🔴"
+            msg = (
+                f"📈 *BTC/USDT 永续合约*\n\n"
+                f"价格: ${price:,.2f}\n"
+                f"24h涨跌: {emoji} {chg:+.2f}%\n"
+                f"24h最高: ${high:,.2f}\n"
+                f"24h最低: ${low:,.2f}\n"
+                f"成交额: ${vol/1e9:.2f}B"
+            )
+            tg_send(chat_id, msg)
+        except Exception as e:
+            tg_send(chat_id, f"❌ 获取行情失败: {str(e)}")
+        return True
+
+    return False
+
+
+# ============ AI 对话 ============
 def ai_chat(user_message: str) -> str:
     """调用 DeepSeek API 生成回复"""
     if not AI_API_KEY:
@@ -62,8 +195,7 @@ def ai_chat(user_message: str) -> str:
 当用户问及市场行情或信号时，引导他们使用 /signals 或 /heat 命令。"""
 
     try:
-        import requests as req
-        resp = req.post(
+        resp = requests.post(
             f"{AI_BASE_URL}/chat/completions",
             headers={
                 "Authorization": f"Bearer {AI_API_KEY}",
@@ -89,142 +221,36 @@ def ai_chat(user_message: str) -> str:
         return f"🤖 AI 对话出错: {str(e)}"
 
 
-# ============ Telegram Bot (PTB v20 Webhook) ============
-def setup_ptb():
-    """设置 python-telegram-bot Application 用于处理 webhook"""
-    from telegram import Update
-    from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
-    if not TG_BOT_TOKEN:
-        print("[Bot] TG_BOT_TOKEN 未配置")
-        return None
-
-    application = Application.builder().token(TG_BOT_TOKEN).build()
-
-    # /start 命令
-    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        welcome = (
-            "🚀 *Crypto Coke Bot 已上线！*\n\n"
-            "我是你的加密货币交易助手，支持：\n\n"
-            "🤖 *AI 对话* — 直接发消息跟我聊天\n"
-            "📡 */signals* — 查看最新费率转负信号\n"
-            "📊 */heat* — 查看热度做多雷达排行\n"
-            "📈 */btc* — BTC 实时行情\n"
-            "💡 */help* — 查看所有命令\n\n"
-            "随便问我什么，开始吧！"
-        )
-        await update.message.reply_text(welcome, parse_mode='Markdown')
-
-    # /help 命令
-    async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        help_text = (
-            "📋 *可用命令：*\n\n"
-            "/start — 启动机器人\n"
-            "/signals — 查看最新费率转负信号\n"
-            "/heat — 查看热度做多雷达\n"
-            "/btc — BTC 实时行情\n"
-            "/help — 显示此帮助\n\n"
-            "或者直接跟我聊天，我会 AI 回复你！"
-        )
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-
-    # /signals 命令
-    async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("📡 正在扫描费率转负信号，请稍候...")
-        try:
-            signals = scan_funding_reversal()
-            if signals:
-                strong = [s for s in signals if s['current_fr'] < 0 and s.get('oi_rising')]
-                if strong:
-                    msg = format_funding_alert(strong)
-                    if msg:
-                        await update.message.reply_text(msg, parse_mode='Markdown')
-                        return
-            await update.message.reply_text("✅ 当前未发现新的费率转负信号")
-        except Exception as e:
-            await update.message.reply_text(f"❌ 扫描出错: {str(e)}")
-
-    # /heat 命令
-    async def cmd_heat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("📊 正在扫描热度雷达，请稍候...")
-        try:
-            hot_list = scan_heat_radar()
-            if hot_list:
-                msg = format_heat_alert(hot_list[:8])
-                if msg:
-                    await update.message.reply_text(msg, parse_mode='Markdown')
-                    return
-            await update.message.reply_text("📊 暂无热度数据")
-        except Exception as e:
-            await update.message.reply_text(f"❌ 扫描出错: {str(e)}")
-
-    # /btc 命令
-    async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("📈 正在获取 BTC 行情...")
-        try:
-            import requests as req
-            ticker = req.get(
-                'https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=BTCUSDT',
-                timeout=10
-            ).json()
-            price = float(ticker['lastPrice'])
-            chg = float(ticker['priceChangePercent'])
-            high = float(ticker['highPrice'])
-            low = float(ticker['lowPrice'])
-            vol = float(ticker['quoteVolume'])
-
-            emoji = "🟢" if chg >= 0 else "🔴"
-            msg = (
-                f"📈 *BTC/USDT 永续合约*\n\n"
-                f"价格: ${price:,.2f}\n"
-                f"24h涨跌: {emoji} {chg:+.2f}%\n"
-                f"24h最高: ${high:,.2f}\n"
-                f"24h最低: ${low:,.2f}\n"
-                f"成交额: ${vol/1e9:.2f}B"
-            )
-            await update.message.reply_text(msg, parse_mode='Markdown')
-        except Exception as e:
-            await update.message.reply_text(f"❌ 获取行情失败: {str(e)}")
-
-    # AI 对话处理 — 普通消息
-    async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_text = update.message.text
-        # 如果是命令，跳过
-        if user_text.startswith('/'):
-            return
-        # 发送"正在输入"状态
-        await update.message.chat.send_action(action="typing")
-        # 调用 AI
-        reply = ai_chat(user_text)
-        await update.message.reply_text(reply, parse_mode='Markdown')
-
-    # 注册 handler
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("signals", cmd_signals))
-    application.add_handler(CommandHandler("heat", cmd_heat))
-    application.add_handler(CommandHandler("btc", cmd_btc))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    return application
-
-
 # ============ Webhook 端点 ============
-application = None
-
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Telegram bot webhook"""
-    global application
-    if not application:
-        return jsonify({"ok": False, "error": "Bot not initialized"}), 500
+    """Telegram bot webhook — 纯同步处理"""
     try:
-        update_data = request.get_json(force=True)
-        from telegram import Update
-        update = Update.de_json(update_data, application.bot)
-        import asyncio
-        asyncio.run(application.process_update(update))
+        update = request.get_json(force=True)
+        if not update:
+            return jsonify({"ok": False, "error": "empty body"}), 400
+
+        # 提取消息
+        message = update.get('message', {})
+        chat_id = message.get('chat', {}).get('id')
+        text = message.get('text', '')
+
+        if not chat_id or not text:
+            return jsonify({"ok": True})  # 忽略非文本消息
+
+        print(f"[Webhook] 收到消息: chat_id={chat_id}, text={text[:50]}")
+
+        # 1. 先尝试命令处理
+        if handle_command(chat_id, text):
+            return jsonify({"ok": True})
+
+        # 2. 非命令消息 → AI 对话
+        tg_send_action(chat_id)
+        reply = ai_chat(text)
+        tg_send(chat_id, reply)
+
         return jsonify({"ok": True})
+
     except Exception as e:
         print(f"[Webhook] 处理错误: {e}")
         import traceback
@@ -257,7 +283,7 @@ def run_scanner():
     """后台线程: 定期运行扫描并推送到 TG"""
     global latest_data
     print("[Scanner] 启动扫描线程")
-    time.sleep(5)  # 等 Web 先启动
+    time.sleep(5)
 
     while True:
         try:
@@ -317,7 +343,6 @@ def run_scanner():
 
             # 更新币种数
             try:
-                import requests
                 info = requests.get(
                     'https://fapi.binance.com/fapi/v1/exchangeInfo', timeout=5
                 ).json()
@@ -335,27 +360,22 @@ def run_scanner():
         except Exception as e:
             print(f"[Scanner] 错误: {e}")
 
-        # 等5分钟
         for _ in range(300):
             time.sleep(1)
 
 
 # ============ 设置 Webhook URL ============
 def set_webhook():
-    """设置 Telegram webhook 指向本服务"""
+    """设置 Telegram webhook"""
     render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
     if not render_url:
-        print("[Webhook] RENDER_EXTERNAL_URL 未设置，跳过 webhook 设置")
+        print("[Webhook] RENDER_EXTERNAL_URL 未设置")
         return False
     webhook_url = f"{render_url}/webhook"
     try:
-        import requests
         resp = requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/setWebhook",
-            json={
-                "url": webhook_url,
-                "allowed_updates": ["message", "callback_query"]
-            },
+            f"{TG_API}/setWebhook",
+            json={"url": webhook_url, "allowed_updates": ["message"]},
             timeout=10
         )
         result = resp.json()
@@ -373,14 +393,8 @@ def set_webhook():
 if __name__ == '__main__':
     print("🚀 Crypto Coke Bot 启动中...")
     print(f"TG Bot: {'已配置' if TG_BOT_TOKEN else '未配置'}")
-    print(f"AI: {'已配置' if AI_API_KEY else '未配置 (将使用模板回复)'}")
+    print(f"AI: {'已配置' if AI_API_KEY else '未配置'}")
     print(f"{'='*50}")
-
-    # 初始化 PTB Application
-    if TG_BOT_TOKEN:
-        application = setup_ptb()
-        if application:
-            print("[Bot] PTB Application 初始化完成")
 
     # 启动后台扫描线程
     scanner = threading.Thread(target=run_scanner, daemon=True)
@@ -394,5 +408,4 @@ if __name__ == '__main__':
     print(f"🌐 Web 服务: http://0.0.0.0:{port}")
     print(f"🤖 Webhook: /webhook")
     print(f"📊 Dashboard: /")
-    print(f"📡 API: /api/status")
     app.run(host='0.0.0.0', port=port)
