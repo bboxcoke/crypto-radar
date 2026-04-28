@@ -223,12 +223,12 @@ def webhook():
         from telegram import Update
         update = Update.de_json(update_data, application.bot)
         import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(application.process_update(update))
+        asyncio.run(application.process_update(update))
         return jsonify({"ok": True})
     except Exception as e:
         print(f"[Webhook] 处理错误: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
