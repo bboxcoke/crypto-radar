@@ -10,3 +10,9 @@ services:
         sync: false
       - key: TG_CHAT_ID
         sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_BASE_URL
+        value: https://api.deepseek.com
+      - key: AI_MODEL
+        value: deepseek-chat
