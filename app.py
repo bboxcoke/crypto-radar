@@ -300,6 +300,7 @@ def api_debug():
         'binance_api': bool(BINANCE_API_KEY),
         'binance_key_prefix': BINANCE_API_KEY[:12] + '...' if BINANCE_API_KEY else 'N/A',
         'binance_secret_prefix': BINANCE_API_SECRET[:8] + '...' if BINANCE_API_SECRET else 'N/A',
+        'api_test': (lambda: (lambda r: '✅ OK' if (r and isinstance(r, list)) else str(r.get('msg',''))[:50])(__import__('requests').get('https://fapi.binance.com/fapi/v2/balance', params={'timestamp': int(__import__('time').time()*1000), 'signature': __import__('hmac').new(BINANCE_API_SECRET.encode(), __import__('urllib.parse').urlencode({'timestamp': int(__import__('time').time()*1000)}).encode(), __import__('hashlib').sha256).hexdigest()}, headers={'X-MBX-APIKEY': BINANCE_API_KEY}).json()) if BINANCE_API_KEY and BINANCE_API_SECRET else '未配置')(),
         'startup_time': latest_data.get('startup_time'),
         'server_time': time.strftime('%H:%M:%S'),
     })
