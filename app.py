@@ -50,6 +50,9 @@ latest_data = {
     'total_coins': 0,
     'today_signals': 0,
     'last_scan': None,
+    'scanner_alive': False,
+    'scanner_errors': [],
+    'startup_time': time.strftime('%m-%d %H:%M:%S'),
 }
 
 # ============ Telegram API (纯 requests) ============
@@ -281,6 +284,25 @@ def api_status():
     })
 
 
+@app.route('/api/debug')
+def api_debug():
+    """调试信息"""
+    return jsonify({
+        'scanner_alive': latest_data.get('scanner_alive', False),
+        'scanner_errors': latest_data.get('scanner_errors', []),
+        'last_scan': latest_data.get('last_scan'),
+        'total_coins': latest_data.get('total_coins'),
+        'tg_configured': bool(TG_BOT_TOKEN and TG_CHAT_ID),
+        'tg_token_prefix': TG_BOT_TOKEN[:15] + '...' if TG_BOT_TOKEN else 'NOT SET',
+        'tg_chat_id': TG_CHAT_ID or 'NOT SET',
+        'auto_trade': AUTO_TRADE_ENABLED,
+        'sim_mode': SIMULATION_MODE,
+        'binance_api': bool(BINANCE_API_KEY),
+        'startup_time': latest_data.get('startup_time'),
+        'server_time': time.strftime('%H:%M:%S'),
+    })
+
+
 @app.route('/')
 def index():
     """Dashboard 页面"""
@@ -295,8 +317,15 @@ def run_scanner():
     """后台线程: 定期运行扫描并推送到 TG"""
     global latest_data
     print("[Scanner] 启动扫描线程")
+
+    # 启动标记 - 表示线程已启动
+    latest_data['scanner_alive'] = True
+    
     time.sleep(5)
 
+    # 初始化去重文件
+    fr_alert_file = SCRIPT_DIR / "fr_alert_history.json"
+    
     while True:
         try:
             ts = time.strftime('%m-%d %H:%M:%S')
@@ -333,8 +362,9 @@ def run_scanner():
             else:
                 latest_data['signals'] = []
 
-            # 2. 热度雷达 (每15分钟)
             current_min = datetime.now().minute
+
+            # 2. 热度雷达 (每15分钟)
             if current_min % 15 < 5:
                 hot_list = scan_heat_radar()
                 if hot_list:
@@ -343,55 +373,57 @@ def run_scanner():
                         send_tg(msg)
                         print(f"[Scanner] 推送热度 TOP8")
                     latest_data['heat_list'] = [{
-                        'symbol': s['symbol'],
-                        'coin': s['coin'],
-                        'price': s['price'],
-                        'price_chg_24h': s['price_chg_24h'],
-                        'volume': s['volume'],
-                        'oi_change_1h': s['oi_change_1h'],
-                        'funding_rate': s['funding_rate'],
-                        'heat_score': s['heat_score'],
+                        'symbol': s['symbol'], 'coin': s['coin'],
+                        'price': s['price'], 'price_chg_24h': s['price_chg_24h'],
+                        'volume': s['volume'], 'oi_change_1h': s['oi_change_1h'],
+                        'funding_rate': s['funding_rate'], 'heat_score': s['heat_score'],
                     } for s in hot_list[:15]]
 
             # 3. 费率极端值推送（每5分钟）
-            fr_history = load_history(Path(SCRIPT_DIR) / "fr_alert_history.json")
-            extreme = scan_extreme_funding()
-            if extreme:
-                from crypto_radar import is_duplicate as fr_is_dup
-                from crypto_radar import mark_alerted as fr_mark
-                new_extreme = [s for s in extreme
-                               if not fr_is_dup(s['symbol'], fr_history, FR_DEDUP_HOURS)]
-                if new_extreme and TG_BOT_TOKEN and TG_CHAT_ID:
-                    msg = format_extreme_funding_alert(new_extreme)
-                    if msg:
-                        send_tg(msg)
-                        print(f"[Scanner] 推送 {len(new_extreme)} 个费率极端信号")
-                        for s in new_extreme:
-                            fr_history = fr_mark(s['symbol'], fr_history, FR_DEDUP_HOURS)
-                        save_history(fr_history, Path(SCRIPT_DIR) / "fr_alert_history.json")
+            try:
+                fr_hist = {}
+                if fr_alert_file.exists():
+                    fr_hist = json.loads(fr_alert_file.read_text())
+                extreme = scan_extreme_funding()
+                if extreme:
+                    new_x = [s for s in extreme
+                             if not is_duplicate(s['symbol'], fr_hist, FR_DEDUP_HOURS)]
+                    if new_x and TG_BOT_TOKEN and TG_CHAT_ID:
+                        msg = format_extreme_funding_alert(new_x)
+                        if msg:
+                            send_tg(msg)
+                            print(f"[Scanner] 推送 {len(new_x)} 个费率极端信号")
+                            for s in new_x:
+                                fr_hist = mark_alerted(s['symbol'], fr_hist, FR_DEDUP_HOURS)
+                            fr_alert_file.write_text(json.dumps(fr_hist, indent=2))
+            except Exception as e:
+                print(f"[Scanner] 费率极端值错误: {e}")
 
             # 4. 套利信号（每15分钟）
             if current_min % 15 < 5:
-                arb_data = scan_arbitrage_signals()
-                if arb_data:
-                    msg = format_arbitrage_alert(arb_data)
-                    if msg and TG_BOT_TOKEN and TG_CHAT_ID:
-                        send_tg(msg)
-                        print(f"[Scanner] 推送套利信号")
+                try:
+                    arb_data = scan_arbitrage_signals()
+                    if arb_data:
+                        msg = format_arbitrage_alert(arb_data)
+                        if msg and TG_BOT_TOKEN and TG_CHAT_ID:
+                            send_tg(msg)
+                            print(f"[Scanner] 推送套利信号")
+                except Exception as e:
+                    print(f"[Scanner] 套利信号错误: {e}")
 
-            # 5. 自动交易/模拟交易检查
+            # 5. 模拟交易检查
+            if not AUTO_TRADE_ENABLED:
+                try:
+                    simulate_auto_trade()
+                except Exception as e:
+                    print(f"[Scanner] 模拟交易错误: {e}")
+
+            # 6. 自动交易（仅当开启且有API Key时）
             if AUTO_TRADE_ENABLED and BINANCE_API_KEY:
                 try:
                     auto_trade()
                 except Exception as e:
                     print(f"[Scanner] 自动交易错误: {e}")
-
-            # 6. 模拟盘（自动交易未开启时）
-            if not AUTO_TRADE_ENABLED and SIMULATION_MODE:
-                try:
-                    simulate_auto_trade()
-                except Exception as e:
-                    print(f"[Scanner] 模拟交易错误: {e}")
 
             # 更新币种数
             try:
@@ -410,7 +442,9 @@ def run_scanner():
             latest_data['last_scan'] = time.strftime('%H:%M:%S')
 
         except Exception as e:
+            err_msg = f"{time.strftime('%H:%M:%S')} {e}"
             print(f"[Scanner] 错误: {e}")
+            latest_data['scanner_errors'] = (latest_data.get('scanner_errors', []) + [err_msg])[-5:]
 
         for _ in range(300):
             time.sleep(1)
