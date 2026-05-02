@@ -299,6 +299,7 @@ def api_debug():
         'sim_mode': SIMULATION_MODE,
         'binance_api': bool(BINANCE_API_KEY),
         'binance_key_prefix': BINANCE_API_KEY[:12] + '...' if BINANCE_API_KEY else 'N/A',
+        'binance_secret_prefix': BINANCE_API_SECRET[:8] + '...' if BINANCE_API_SECRET else 'N/A',
         'startup_time': latest_data.get('startup_time'),
         'server_time': time.strftime('%H:%M:%S'),
     })
