@@ -480,7 +480,25 @@ if __name__ == '__main__':
     print("🚀 Crypto Coke Bot 启动中...")
     print(f"TG Bot: {'已配置' if TG_BOT_TOKEN else '未配置'}")
     print(f"AI: {'已配置' if AI_API_KEY else '未配置'}")
+    print(f"自动交易: {'已开启' if AUTO_TRADE_ENABLED else '已关闭'}")
+    print(f"模拟盘: {'已开启' if SIMULATION_MODE else '已关闭'}")
     print(f"{'='*50}")
+
+    # 发送启动通知
+    startup_msg = (
+        f"🚀 *Crypto Bot 已重启*\n"
+        f"自动交易: {'🟢 开启' if AUTO_TRADE_ENABLED else '🔴 关闭'}\n"
+        f"模拟盘: {'🟢 开启' if SIMULATION_MODE else '🔴 关闭'}\n"
+        f"币安API: {'🟢 已配置' if BINANCE_API_KEY else '🔴 未配置'}"
+    )
+    if TG_BOT_TOKEN and TG_CHAT_ID:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TG_CHAT_ID, "text": startup_msg, "parse_mode": "Markdown"},
+                timeout=10)
+            print("✅ 启动通知已发送")
+        except Exception as e:
+            print(f"⚠️ 启动通知发送失败: {e}")
 
     # 启动后台扫描线程
     scanner = threading.Thread(target=run_scanner, daemon=True)
