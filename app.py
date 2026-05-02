@@ -28,7 +28,7 @@ from crypto_radar import (
     format_funding_alert, format_heat_alert,
     format_extreme_funding_alert, format_arbitrage_alert,
     send_tg, load_history, save_history, mark_alerted, is_duplicate,
-    auto_trade, AUTO_TRADE_ENABLED, BINANCE_API_KEY, recover_trade_state,
+    auto_trade, AUTO_TRADE_ENABLED, BINANCE_API_KEY, BINANCE_API_SECRET, recover_trade_state,
     FR_ALERT_THRESHOLD, FR_DEDUP_HOURS,
     simulate_auto_trade, SIMULATION_MODE
 )
