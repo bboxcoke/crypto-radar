@@ -24,8 +24,12 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from crypto_radar import (
     scan_funding_reversal, scan_heat_radar,
+    scan_extreme_funding, scan_arbitrage_signals,
     format_funding_alert, format_heat_alert,
-    send_tg, load_history, save_history, mark_alerted, is_duplicate
+    format_extreme_funding_alert, format_arbitrage_alert,
+    send_tg, load_history, save_history, mark_alerted, is_duplicate,
+    auto_trade, AUTO_TRADE_ENABLED, BINANCE_API_KEY, recover_trade_state,
+    FR_ALERT_THRESHOLD, FR_DEDUP_HOURS
 )
 
 # ============ 配置 ============
@@ -193,7 +197,10 @@ def ai_chat(user_message: str) -> str:
 当前你有以下能力：
 1. 币安合约 OI + 资金费率扫描
 2. 热度做多雷达
-3. 加密货币知识问答
+3. 费率极端值监控（⚠️ 自动推送）
+4. 多空配对套利信号（🔄 自动推送）
+5. 自动交易执行（🤖 仅操作主人账户）
+6. 加密货币知识问答
 
 请用中文回复，语言风格亲切专业。
 当用户问及市场行情或信号时，引导他们使用 /signals 或 /heat 命令。"""
@@ -345,6 +352,39 @@ def run_scanner():
                         'heat_score': s['heat_score'],
                     } for s in hot_list[:15]]
 
+            # 3. 费率极端值推送（每5分钟）
+            fr_history = load_history(Path(SCRIPT_DIR) / "fr_alert_history.json")
+            extreme = scan_extreme_funding()
+            if extreme:
+                from crypto_radar import is_duplicate as fr_is_dup
+                from crypto_radar import mark_alerted as fr_mark
+                new_extreme = [s for s in extreme
+                               if not fr_is_dup(s['symbol'], fr_history, FR_DEDUP_HOURS)]
+                if new_extreme and TG_BOT_TOKEN and TG_CHAT_ID:
+                    msg = format_extreme_funding_alert(new_extreme)
+                    if msg:
+                        send_tg(msg)
+                        print(f"[Scanner] 推送 {len(new_extreme)} 个费率极端信号")
+                        for s in new_extreme:
+                            fr_history = fr_mark(s['symbol'], fr_history, FR_DEDUP_HOURS)
+                        save_history(fr_history, Path(SCRIPT_DIR) / "fr_alert_history.json")
+
+            # 4. 套利信号（每15分钟）
+            if current_min % 15 < 5:
+                arb_data = scan_arbitrage_signals()
+                if arb_data:
+                    msg = format_arbitrage_alert(arb_data)
+                    if msg and TG_BOT_TOKEN and TG_CHAT_ID:
+                        send_tg(msg)
+                        print(f"[Scanner] 推送套利信号")
+
+            # 5. 自动交易检查
+            if AUTO_TRADE_ENABLED and BINANCE_API_KEY:
+                try:
+                    auto_trade()
+                except Exception as e:
+                    print(f"[Scanner] 自动交易错误: {e}")
+
             # 更新币种数
             try:
                 info = requests.get(
@@ -403,6 +443,12 @@ if __name__ == '__main__':
     # 启动后台扫描线程
     scanner = threading.Thread(target=run_scanner, daemon=True)
     scanner.start()
+
+    # 恢复自动交易状态
+    if AUTO_TRADE_ENABLED and BINANCE_API_KEY:
+        state = recover_trade_state()
+        if state.get('position'):
+            print(f"↩️ 恢复持仓: {state['symbol']} {state['side']}")
 
     # 尝试设置 webhook
     set_webhook()
