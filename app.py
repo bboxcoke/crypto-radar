@@ -29,7 +29,8 @@ from crypto_radar import (
     format_extreme_funding_alert, format_arbitrage_alert,
     send_tg, load_history, save_history, mark_alerted, is_duplicate,
     auto_trade, AUTO_TRADE_ENABLED, BINANCE_API_KEY, recover_trade_state,
-    FR_ALERT_THRESHOLD, FR_DEDUP_HOURS
+    FR_ALERT_THRESHOLD, FR_DEDUP_HOURS,
+    simulate_auto_trade, SIMULATION_MODE
 )
 
 # ============ 配置 ============
@@ -378,12 +379,19 @@ def run_scanner():
                         send_tg(msg)
                         print(f"[Scanner] 推送套利信号")
 
-            # 5. 自动交易检查
+            # 5. 自动交易/模拟交易检查
             if AUTO_TRADE_ENABLED and BINANCE_API_KEY:
                 try:
                     auto_trade()
                 except Exception as e:
                     print(f"[Scanner] 自动交易错误: {e}")
+
+            # 6. 模拟盘（自动交易未开启时）
+            if not AUTO_TRADE_ENABLED and SIMULATION_MODE:
+                try:
+                    simulate_auto_trade()
+                except Exception as e:
+                    print(f"[Scanner] 模拟交易错误: {e}")
 
             # 更新币种数
             try:

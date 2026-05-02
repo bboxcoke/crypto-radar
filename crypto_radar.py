@@ -26,6 +26,7 @@ SCRIPT_DIR = Path(__file__).parent
 ALERT_HISTORY_FILE = SCRIPT_DIR / "alert_history.json"
 FR_SNAPSHOT_FILE = SCRIPT_DIR / "fr_snapshot.json"
 TRADE_STATE_FILE = SCRIPT_DIR / "trade_state.json"
+SIM_TRADE_STATE_FILE = SCRIPT_DIR / "sim_trade_state.json"
 
 # 信号参数
 MIN_OI_CHANGE_PCT = 8
@@ -52,7 +53,7 @@ def load_env():
     for k in ['TG_BOT_TOKEN', 'TG_CHAT_ID', 'SCAN_INTERVAL',
               'BINANCE_API_KEY', 'BINANCE_API_SECRET',
               'AUTO_TRADE_ENABLED', 'TRADE_POSITION_USDT',
-              'FR_ALERT_THRESHOLD']:
+              'FR_ALERT_THRESHOLD', 'SIMULATION_MODE']:
         if os.environ.get(k):
             env[k] = os.environ[k]
     return env
@@ -66,6 +67,7 @@ SCAN_INTERVAL = int(env.get('SCAN_INTERVAL', '300'))
 BINANCE_API_KEY = env.get('BINANCE_API_KEY', '')
 BINANCE_API_SECRET = env.get('BINANCE_API_SECRET', '')
 AUTO_TRADE_ENABLED = env.get('AUTO_TRADE_ENABLED', 'false').lower() == 'true'
+SIMULATION_MODE = env.get('SIMULATION_MODE', 'true').lower() == 'true'  # 默认开启模拟盘
 TRADE_POSITION_USDT = float(env.get('TRADE_POSITION_USDT', str(MAX_POSITION_USDT)))
 TRADE_POSITION_USDT = min(TRADE_POSITION_USDT, MAX_POSITION_USDT)  # 不能超过硬编码上限
 
@@ -255,6 +257,173 @@ def recover_trade_state():
         print(f"[TRADE] 从链上恢复持仓: {coin} {side} @ ${entry}")
         return state
     return load_trade_state()
+
+
+# ============ 模拟交易 ============
+SIM_TRADE_STATE_FILE = SCRIPT_DIR / "sim_trade_state.json"
+
+def load_sim_trade_state():
+    if SIM_TRADE_STATE_FILE.exists():
+        try:
+            return json.loads(SIM_TRADE_STATE_FILE.read_text())
+        except:
+            pass
+    return {'position': None, 'entry_price': 0, 'entry_time': None,
+            'symbol': None, 'side': None, 'history': []}
+
+def save_sim_trade_state(state):
+    SIM_TRADE_STATE_FILE.write_text(json.dumps(state, indent=2))
+
+def sim_log_trade(symbol, side, entry_price, exit_price, pnl_pct, reason, fr):
+    state = load_sim_trade_state()
+    if 'history' not in state:
+        state['history'] = []
+    state['history'].append({
+        'symbol': symbol, 'side': side,
+        'entry_price': entry_price, 'exit_price': exit_price,
+        'pnl_pct': pnl_pct, 'reason': reason, 'entry_fr': fr,
+        'time': datetime.now().isoformat()
+    })
+    if len(state['history']) > 50:
+        state['history'] = state['history'][-50:]
+    save_sim_trade_state(state)
+
+def simulate_auto_trade():
+    if not SIMULATION_MODE:
+        return
+    ts = datetime.now().strftime('%H:%M:%S')
+    state = load_sim_trade_state()
+    if state.get('position'):
+        sim_check_close(state)
+    else:
+        sim_check_open()
+    print(f"[{ts}] [SIM] 模拟交易检查完成")
+
+def sim_check_open():
+    try:
+        fr_all = requests.get('https://fapi.binance.com/fapi/v1/premiumIndex', timeout=10).json()
+    except:
+        return
+    try:
+        tickers = requests.get('https://fapi.binance.com/fapi/v1/ticker/24hr', timeout=10).json()
+        ticker_map = {t['symbol']: t for t in tickers}
+    except:
+        ticker_map = {}
+    
+    best_long = None
+    best_short = None
+    for item in fr_all:
+        sym = item['symbol']
+        fr = float(item['lastFundingRate'])
+        vol = float(ticker_map.get(sym, {}).get('quoteVolume', 0))
+        if vol < 1_000_000:
+            continue
+        t = ticker_map.get(sym, {})
+        price = float(t.get('lastPrice', 0))
+        oi_chg = 0
+        try:
+            oi = requests.get('https://fapi.binance.com/futures/data/openInterestHist',
+                params={'symbol': sym, 'period': '1h', 'limit': 4}, timeout=5).json()
+            if oi and len(oi) >= 2:
+                now_val = float(oi[-1]['sumOpenInterestValue'])
+                before_val = float(oi[0]['sumOpenInterestValue'])
+                oi_chg = (now_val - before_val) / before_val * 100 if before_val > 0 else 0
+        except:
+            pass
+        if fr < -FR_ALERT_THRESHOLD and oi_chg > 3:
+            if best_long is None or fr < best_long['funding_rate']:
+                best_long = {'symbol': sym, 'funding_rate': fr, 'price': price, 'oi_chg': oi_chg}
+        if fr > FR_ALERT_THRESHOLD and oi_chg < -3:
+            if best_short is None or fr > best_short['funding_rate']:
+                best_short = {'symbol': sym, 'funding_rate': fr, 'price': price, 'oi_chg': oi_chg}
+    
+    target = None
+    if best_short and not best_long:
+        target = best_short
+        target['side'] = 'SHORT'
+    elif best_long and not best_short:
+        target = best_long
+        target['side'] = 'LONG'
+    elif best_long and best_short:
+        long_str = abs(best_long['funding_rate']) + best_long['oi_chg'] / 10
+        short_str = best_short['funding_rate'] + abs(best_short['oi_chg']) / 10
+        target = best_long if long_str >= short_str else best_short
+        target['side'] = 'LONG' if long_str >= short_str else 'SHORT'
+    
+    if target:
+        sim_open_position(target['symbol'], target['side'], target['price'], target['funding_rate'])
+    else:
+        ts = datetime.now().strftime('%H:%M:%S')
+        print(f"[{ts}] [SIM] 无开仓信号")
+
+def sim_open_position(symbol, side, price, fr):
+    ts = datetime.now().strftime('%H:%M:%S')
+    coin = symbol.replace('USDT', '')
+    state = {
+        'position': symbol, 'entry_price': price,
+        'entry_time': datetime.now().isoformat(), 'symbol': symbol,
+        'side': side, 'entry_fr': fr,
+        'quantity': round(TRADE_POSITION_USDT / price, 3),
+        'history': []
+    }
+    save_sim_trade_state(state)
+    print(f"[{ts}] [SIM] 🧪 模拟开仓: {coin} {side} @ ${price:.4f} 费率:{fr:+.4%}")
+    msg = (
+        f"🧪 *模拟交易开仓*  {coin}\n"
+        f"方向: **{side}**  |  开仓价: ${price:.4f}\n"
+        f"费率: {fr:+.4%}  |  止损: {STOP_LOSS_PCT:.0f}%  止盈: +{TAKE_PROFIT_PCT:.0f}%"
+    )
+    send_tg(msg)
+
+def sim_check_close(state):
+    ts = datetime.now().strftime('%H:%M:%S')
+    symbol = state['symbol']
+    side = state['side']
+    entry_price = state['entry_price']
+    coin = symbol.replace('USDT', '')
+    try:
+        ticker = requests.get(f'https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={symbol}', timeout=5).json()
+        current_price = float(ticker.get('lastPrice', 0))
+    except:
+        return
+    pnl_pct = (current_price - entry_price) / entry_price * 100 if side == 'LONG' else (entry_price - current_price) / entry_price * 100
+    print(f"[{ts}] [SIM] {coin} {side} 入场:${entry_price:.4f} 当前:${current_price:.4f} 盈亏:{pnl_pct:+.2f}%")
+    
+    if pnl_pct <= STOP_LOSS_PCT:
+        sim_close_position(symbol, entry_price, current_price, side, pnl_pct, f'止损触发')
+    elif pnl_pct >= TAKE_PROFIT_PCT:
+        sim_close_position(symbol, entry_price, current_price, side, pnl_pct, f'止盈触发')
+    else:
+        try:
+            fr_all = requests.get('https://fapi.binance.com/fapi/v1/premiumIndex', timeout=5).json()
+            fr_map = {item['symbol']: float(item['lastFundingRate']) for item in fr_all}
+            if abs(fr_map.get(symbol, 0)) < FR_ALERT_THRESHOLD / 2 and pnl_pct > 0:
+                sim_close_position(symbol, entry_price, current_price, side, pnl_pct, '费率回归')
+        except:
+            pass
+
+def sim_close_position(symbol, entry_price, exit_price, side, pnl_pct, reason):
+    coin = symbol.replace('USDT', '')
+    emoji = '🟢' if pnl_pct > 0 else '🔴'
+    state = load_sim_trade_state()
+    entry_fr = state.get('entry_fr', 0)
+    quantity = state.get('quantity', 0)
+    pnl_usdt = (exit_price - entry_price) * quantity if side == 'LONG' else (entry_price - exit_price) * quantity
+    sim_log_trade(symbol, side, entry_price, exit_price, pnl_pct, reason, entry_fr)
+    saved_history = load_sim_trade_state().get('history', [])
+    save_sim_trade_state({'position': None, 'entry_price': 0, 'entry_time': None,
+                          'symbol': None, 'side': None, 'history': saved_history})
+    total_pnl = sum(h.get('pnl_pct', 0) for h in saved_history)
+    wins = sum(1 for h in saved_history if h.get('pnl_pct', 0) > 0)
+    total = len(saved_history)
+    msg = (
+        f"{emoji} *模拟交易平仓*  {coin}\n"
+        f"入场: ${entry_price:.4f} → 出场: ${exit_price:.4f}\n"
+        f"盈亏: **{pnl_pct:+.2f}%** (${pnl_usdt:+.2f})  |  {reason}\n"
+        f"📊 模拟盘: {total}次交易 | 胜率 {wins}/{total} | 累计 {total_pnl:+.2f}%"
+    )
+    send_tg(msg)
+
 
 # ============ 核心扫描: OI + 费率转负 ============
 def scan_funding_reversal():
@@ -991,6 +1160,9 @@ def run_once():
     if AUTO_TRADE_ENABLED:
         print("\n🤖 自动交易检查...")
         auto_trade()
+    elif SIMULATION_MODE:
+        print("\n🧪 模拟交易检查...")
+        simulate_auto_trade()
     
     print(f"\n✅ 完成\n")
 
